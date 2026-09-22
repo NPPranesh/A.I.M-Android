@@ -15,13 +15,6 @@ data class TelemetryResponse(
     val telemetry: TelemetryDetails?
 )
 
-data class TelemetryDetails(
-    val sample_count: Int,
-    val rms_amplitude: Float,
-    val zero_crossing_rate: Float,
-    val spectral_centroid_hz: Float
-)
-
 // 2. Retrofit Interface
 interface AimApiService {
     @Multipart

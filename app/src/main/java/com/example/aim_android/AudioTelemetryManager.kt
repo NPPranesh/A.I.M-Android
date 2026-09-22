@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.util.Log
 import java.io.ByteArrayOutputStream
 
 class AudioTelemetryManager {
@@ -24,50 +25,78 @@ class AudioTelemetryManager {
 
     @SuppressLint("MissingPermission")
     fun startRecording(onChunkCaptured: (ByteArray) -> Unit) {
-        audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            sampleRate, channelConfig, audioFormat, bufferSize
-        )
-        audioRecord?.startRecording()
-        isRecording = true
+        try {
+            audioRecord = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate, channelConfig, audioFormat, bufferSize
+            )
 
-        Thread {
-            val readBuffer = ByteArray(bufferSize)
-            val rollingStream = ByteArrayOutputStream()
-            var unpostedBytes = 0
+            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+                audioRecord?.release()
+                audioRecord = null
+                throw IllegalStateException("AudioRecord failed to initialize properly.")
+            }
 
-            while (isRecording) {
-                val bytesRead = audioRecord?.read(readBuffer, 0, bufferSize) ?: 0
-                if (bytesRead > 0) {
-                    rollingStream.write(readBuffer, 0, bytesRead)
-                    unpostedBytes += bytesRead
+            audioRecord?.startRecording()
 
-                    // Dispatch every time 1 second of NEW audio arrives
-                    if (unpostedBytes >= stepSizeBytes) {
-                        val fullStreamBytes = rollingStream.toByteArray()
+            if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                isRecording = true
 
-                        // Grab up to the last 3 seconds of continuous audio
-                        val startIdx = maxOf(0, fullStreamBytes.size - windowSizeBytes)
-                        val windowChunk = fullStreamBytes.copyOfRange(startIdx, fullStreamBytes.size)
+                Thread {
+                    val readBuffer = ByteArray(bufferSize)
+                    val rollingStream = ByteArrayOutputStream()
+                    var unpostedBytes = 0
 
-                        onChunkCaptured(windowChunk)
-                        unpostedBytes = 0
+                    while (isRecording) {
+                        val bytesRead = audioRecord?.read(readBuffer, 0, bufferSize) ?: 0
+                        if (bytesRead > 0) {
+                            rollingStream.write(readBuffer, 0, bytesRead)
+                            unpostedBytes += bytesRead
 
-                        // Prune memory if stream gets excessively large
-                        if (fullStreamBytes.size > windowSizeBytes * 2) {
-                            rollingStream.reset()
-                            rollingStream.write(windowChunk)
+                            // Dispatch every time 1 second of NEW audio arrives
+                            if (unpostedBytes >= stepSizeBytes) {
+                                val fullStreamBytes = rollingStream.toByteArray()
+
+                                // Grab up to the last 3 seconds of continuous audio
+                                val startIdx = maxOf(0, fullStreamBytes.size - windowSizeBytes)
+                                val windowChunk = fullStreamBytes.copyOfRange(startIdx, fullStreamBytes.size)
+
+                                onChunkCaptured(windowChunk)
+                                unpostedBytes = 0
+
+                                // Prune memory if stream gets excessively large
+                                if (fullStreamBytes.size > windowSizeBytes * 2) {
+                                    rollingStream.reset()
+                                    rollingStream.write(windowChunk)
+                                }
+                            }
                         }
                     }
-                }
+                }.start()
+            } else {
+                isRecording = false
+                throw IllegalStateException("AudioRecord failed to enter RECORDSTATE_RECORDING.")
             }
-        }.start()
+        } catch (e: Exception) {
+            isRecording = false
+            try {
+                audioRecord?.release()
+            } catch (_: Exception) {}
+            audioRecord = null
+            Log.e("AIM_AUDIO", "Error starting AudioRecord", e)
+            throw e
+        }
     }
 
     fun stopRecording() {
         isRecording = false
-        audioRecord?.stop()
-        audioRecord?.release()
-        audioRecord = null
+        try {
+            audioRecord?.stop()
+        } catch (e: Exception) {
+            Log.e("AIM_AUDIO", "Error stopping AudioRecord", e)
+        } finally {
+            audioRecord?.release()
+            audioRecord = null
+        }
     }
 }
