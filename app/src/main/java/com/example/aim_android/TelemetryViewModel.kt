@@ -8,6 +8,12 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.aim_android.audio.OnDeviceWhisperEngine
+import com.example.aim_android.data.AimDatabase
+import com.example.aim_android.data.SessionEntity
+import com.example.aim_android.data.TelemetrySampleEntity
+import com.example.aim_android.data.TranscriptEntity
+import com.example.aim_android.models.EyeMetrics
+import com.example.aim_android.models.HeadPose
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -18,10 +24,18 @@ import kotlin.math.sqrt
 
 class TelemetryViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val db = AimDatabase.getDatabase(application)
+    private val dao = db.telemetryDao()
     private val recorder = AudioTelemetryManager()
     private val whisperEngine by lazy {
         OnDeviceWhisperEngine(application.applicationContext)
     }
+
+    private var currentSessionId: Long? = null
+    private var currentVisionScore: Float = 0f
+    private var currentEyeMetrics: EyeMetrics? = null
+    private var currentHeadPose: HeadPose? = null
+    private var isFaceDetected: Boolean = false
 
     var isRecording by mutableStateOf(false)
         private set
@@ -38,9 +52,44 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
     // Buffer to accumulate active speech samples for Whisper decoding
     private val speechAccumulator = ArrayList<Float>()
 
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // Force Room database file creation on disk immediately for Database Inspector
+                db.openHelper.writableDatabase
+                Log.d("AIM_DB", "Database initialized on disk successfully.")
+            } catch (e: Exception) {
+                Log.e("AIM_DB", "Database initialization error: ${e.localizedMessage}", e)
+            }
+        }
+    }
+
+    fun updateVisionMetrics(
+        visionScore: Float,
+        eyeMetrics: EyeMetrics? = null,
+        headPose: HeadPose? = null,
+        faceDetected: Boolean = true
+    ) {
+        currentVisionScore = visionScore
+        currentEyeMetrics = eyeMetrics
+        currentHeadPose = headPose
+        isFaceDetected = faceDetected
+    }
+
     fun startStreaming() {
         if (isRecording) return
         errorMessage = null
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val newSession = SessionEntity(startTime = System.currentTimeMillis())
+                val id = dao.insertSession(newSession)
+                currentSessionId = id
+                Log.d("AIM_DB", "SESSION STARTED -> ID: $id")
+            } catch (e: Exception) {
+                Log.e("AIM_DB", "Failed to insert session", e)
+            }
+        }
 
         try {
             recorder.startRecording { pcmBytes ->
@@ -69,6 +118,7 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
         } catch (e: Exception) {
             Log.e("AIM_AUDIO", "Error stopping audio recorder", e)
         }
+        currentSessionId = null
     }
 
     private fun processAudioChunkLocally(bytes: ByteArray) {
@@ -94,6 +144,29 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
                     latestTelemetry = telemetry
                 }
 
+                // Insert 1 Hz Telemetry Sample into Room database if recording session active
+                val sessionId = currentSessionId
+                if (sessionId != null) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        try {
+                            val sampleEntity = TelemetrySampleEntity(
+                                sessionId = sessionId,
+                                timestamp = System.currentTimeMillis(),
+                                attentionScore = currentVisionScore,
+                                isGazeAverted = currentEyeMetrics?.isGazeAverted ?: false,
+                                isHeadTurned = currentHeadPose?.isHeadTurned ?: false,
+                                isBlinking = currentEyeMetrics?.isBlinking ?: false,
+                                rmsAmplitude = rms,
+                                spectralCentroidHz = centroid
+                            )
+                            dao.insertTelemetrySample(sampleEntity)
+                            Log.d("AIM_DB", "SAVED TELEMETRY SAMPLE -> Session $sessionId")
+                        } catch (e: Exception) {
+                            Log.e("AIM_DB", "Failed to insert telemetry sample", e)
+                        }
+                    }
+                }
+
                 // 3. On-Device Voice Activity Detection & Fixed Window Whisper Transcription
                 if (rms > 0.005f) { // Active speech threshold
                     for (sample in floatSamples) {
@@ -110,6 +183,23 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
                     if (text.isNotBlank()) {
                         withContext(Dispatchers.Main) {
                             latestTranscript = text
+                        }
+
+                        if (sessionId != null) {
+                            viewModelScope.launch(Dispatchers.IO) {
+                                try {
+                                    val transcriptEntity = TranscriptEntity(
+                                        sessionId = sessionId,
+                                        timestamp = System.currentTimeMillis(),
+                                        text = text,
+                                        wordCount = text.trim().split("\\s+".toRegex()).size
+                                    )
+                                    dao.insertTranscript(transcriptEntity)
+                                    Log.d("AIM_DB", "SAVED TRANSCRIPT to Session $sessionId: $text")
+                                } catch (e: Exception) {
+                                    Log.e("AIM_DB", "Failed to insert transcript", e)
+                                }
+                            }
                         }
                     }
                 }

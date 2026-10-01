@@ -32,7 +32,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.aim_android.models.EyeMetrics
 import com.example.aim_android.models.HeadPose
-import com.example.aim_android.AimVisionAnalyzer
 
 class MainActivity : ComponentActivity() {
 
@@ -138,6 +137,12 @@ fun MultimodalTelemetryDashboard(
                                 attentionScore = score
                                 eyeMetrics = eye
                                 headPose = head
+                                viewModel.updateVisionMetrics(
+                                    visionScore = score,
+                                    eyeMetrics = eye,
+                                    headPose = head,
+                                    faceDetected = true
+                                )
                             },
                             onError = { err ->
                                 Log.e("AIM_VISION", err)

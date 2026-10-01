@@ -1,7 +1,6 @@
 package com.example.aim_android
 
 import okhttp3.MultipartBody
-import okhttp3.ResponseBody
 import retrofit2.Response
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -20,7 +19,7 @@ interface AimApiService {
     @Multipart
     @POST("api/telemetry/process-chunk")
     suspend fun uploadAudioChunk(
-        @Part file: MultipartBody.Part
+        @Part file: MultipartBody.Part,
     ): Response<TelemetryResponse>
 }
 
