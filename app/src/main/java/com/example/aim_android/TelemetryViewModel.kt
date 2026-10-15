@@ -21,6 +21,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.sqrt
+import kotlin.synchronized
 
 class TelemetryViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -30,6 +31,16 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
     private val whisperEngine by lazy {
         OnDeviceWhisperEngine(application.applicationContext)
     }
+
+    // Live observable state for UI
+    var latestEngagementMetrics by mutableStateOf(com.example.aim_android.model.EngagementMetrics())
+        private set
+
+    // Math smoothing variables
+    private var smoothedVerbalScore = 0.0f
+    private val decayLambda = 0.15f // Determines how quickly verbal score drops when silent
+    private var totalWordsInSession = 0
+    private val recordedScores = mutableListOf<Float>()
 
     private var currentSessionId: Long? = null
     private var currentVisionScore: Float = 0f
@@ -77,6 +88,10 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun startStreaming() {
+        smoothedVerbalScore = 0f
+        totalWordsInSession = 0
+        recordedScores.clear()
+
         if (isRecording) return
         errorMessage = null
 
@@ -110,15 +125,124 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
             errorMessage = "Audio error: ${e.localizedMessage}"
         }
     }
-
+    private var lastSavedText = ""
     fun stopStreaming() {
+
+        synchronized(bufferLock) {
+            speechAccumulator.clear()
+        }
+        lastSavedText = ""
         isRecording = false
         try {
             recorder.stopRecording()
         } catch (e: Exception) {
             Log.e("AIM_AUDIO", "Error stopping audio recorder", e)
         }
+        val sessionId = currentSessionId
+        if (sessionId != null) {
+            val avgScore = if (recordedScores.isNotEmpty()) recordedScores.average().toFloat() else 0f
+            val words = totalWordsInSession
+
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val finalizedSession = SessionEntity(
+                        sessionId = sessionId,
+                        startTime = System.currentTimeMillis() - (recordedScores.size * 1000L),
+                        endTime = System.currentTimeMillis(),
+                        averageAttentionScore = avgScore,
+                        totalWordsSpoken = words
+                    )
+                    dao.insertSession(finalizedSession)
+                    Log.d("AIM_DB", "SESSION FINALIZED: ID $sessionId | Avg: $avgScore | Words: $words")
+                } catch (e: Exception) {
+                    Log.e("AIM_DB", "Error finalizing session $sessionId", e)
+                }
+            }
+        }
         currentSessionId = null
+    }
+
+    // In TelemetryViewModel.kt
+
+    // Buffer to hold raw PCM samples (16kHz)
+    private val MIN_CHUNK_SAMPLES = (16000 * 2.5).toInt() // 2.5s window
+    private val bufferLock = Any()
+    private var isSessionActive = false // Guard against late background inserts
+
+    fun onAudioBufferReceived(floatSamples: FloatArray, rms: Float) {
+        if (!isSessionActive) return
+
+        synchronized(bufferLock) {
+            // Collect voice audio
+            if (rms > 0.018f) {
+                for (sample in floatSamples) {
+                    speechAccumulator.add(sample)
+                }
+            }
+
+            // Only dispatch when we have accumulated a full 2.5 seconds of voice
+            if (speechAccumulator.size >= MIN_CHUNK_SAMPLES) {
+                val chunkToProcess = speechAccumulator.toFloatArray()
+                speechAccumulator.clear()
+                processAudioChunk(chunkToProcess)
+            }
+        }
+    }
+
+    private fun processAudioChunk(audioSamples: FloatArray) {
+        viewModelScope.launch(Dispatchers.Default) {
+            val rawText = whisperEngine.transcribe(audioSamples)
+            val cleanedText = rawText
+                .replace(Regex("\\[.*?\\]"), "")
+                .replace(Regex("\\(.*?\\)"), "")
+                .trim()
+
+            if (cleanedText.isBlank()) return@launch
+
+            // Deduplicate overlap with previous phrase
+            val previousWords = lastSavedText.lowercase().split("\\s+".toRegex()).filter { it.isNotBlank() }
+            val currentWords = cleanedText.lowercase().split("\\s+".toRegex()).filter { it.isNotBlank() }
+
+            var overlapCount = 0
+            val maxCheck = minOf(previousWords.size, currentWords.size)
+            for (i in maxCheck downTo 1) {
+                if (previousWords.takeLast(i) == currentWords.take(i)) {
+                    overlapCount = i
+                    break
+                }
+            }
+
+            val newWordsList = currentWords.drop(overlapCount)
+            if (newWordsList.isEmpty()) return@launch
+
+            val textToSave = newWordsList.joinToString(" ")
+            lastSavedText = cleanedText
+            val wordCount = newWordsList.size
+
+            totalWordsInSession += wordCount
+
+            withContext(Dispatchers.Main) {
+                latestTranscript = textToSave
+            }
+
+            currentSessionId?.let { id ->
+                viewModelScope.launch(Dispatchers.IO) {
+                    try {
+                        dao.insertTranscript(
+                            TranscriptEntity(
+                                sessionId = id,
+                                timestamp = System.currentTimeMillis(),
+                                text = textToSave,
+                                wordCount = wordCount
+                            )
+                        )
+                        Log.d("AIM_DB", "SAVED TRANSCRIPT to Session $id: $textToSave")
+                    } catch (e: Exception) {
+                        Log.e("AIM_DB", "Failed to insert transcript", e)
+                    }
+                }
+            }
+        }
     }
 
     private fun processAudioChunkLocally(bytes: ByteArray) {
@@ -133,6 +257,20 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
                 val zcr = calculateZcr(floatSamples)
                 val centroid = calculateSpectralCentroid(floatSamples)
 
+                val instantVerbal = if (rms > 0.005f) 100f else 0f
+                smoothedVerbalScore = (smoothedVerbalScore * kotlin.math.exp(-decayLambda)) +
+                        (instantVerbal * (1f - kotlin.math.exp(-decayLambda)))
+
+                val cei = ((currentVisionScore * 0.6f) + (smoothedVerbalScore * 0.4f)).coerceIn(0f, 100f)
+                recordedScores.add(currentVisionScore)
+
+                val level = when {
+                    cei >= 75f -> com.example.aim_android.model.EngagementLevel.HIGH
+                    cei >= 50f -> com.example.aim_android.model.EngagementLevel.MODERATE
+                    cei >= 25f -> com.example.aim_android.model.EngagementLevel.LOW
+                    else -> com.example.aim_android.model.EngagementLevel.DISENGAGED
+                }
+
                 val telemetry = TelemetryDetails(
                     sample_count = floatSamples.size,
                     rms_amplitude = rms,
@@ -142,6 +280,13 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
 
                 withContext(Dispatchers.Main) {
                     latestTelemetry = telemetry
+                    latestEngagementMetrics = com.example.aim_android.model.EngagementMetrics(
+                        visualAttentionScore = currentVisionScore,
+                        verbalEngagementScore = smoothedVerbalScore,
+                        combinedEngagementIndex = cei,
+                        engagementLevel = level,
+                        wordsSpokenCount = totalWordsInSession
+                    )
                 }
 
                 // Insert 1 Hz Telemetry Sample into Room database if recording session active
@@ -181,6 +326,8 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
                     val text = whisperEngine.transcribe(audioToTranscribe)
                     Log.d("AIM_AUDIO", "Transcribed: $text")
                     if (text.isNotBlank()) {
+                        val words = text.trim().split("\\s+".toRegex()).size
+                        totalWordsInSession += words
                         withContext(Dispatchers.Main) {
                             latestTranscript = text
                         }
