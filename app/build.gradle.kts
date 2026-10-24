@@ -10,6 +10,13 @@ android {
         version = release(37)
     }
 
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.example.aim_android"
         minSdk = 24
@@ -43,9 +50,21 @@ android {
         noCompress += listOf("task", "tflite", "onnx", "bin", "txt")
     }
 
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("src/main/jniLibs")
+        }
+    }
+
     packaging {
         jniLibs {
             useLegacyPackaging = true
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 }
@@ -72,6 +91,13 @@ dependencies {
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
     ksp("androidx.room:room-compiler:$roomVersion")
+
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.activity:activity-compose:1.9.2")
+
 
     // Compose & AndroidX (Existing)
     implementation(platform(libs.androidx.compose.bom))

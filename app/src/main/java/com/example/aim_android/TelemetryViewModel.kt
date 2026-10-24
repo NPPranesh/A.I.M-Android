@@ -17,36 +17,26 @@ import com.example.aim_android.models.HeadPose
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.sqrt
-import kotlin.synchronized
 
 class TelemetryViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = AimDatabase.getDatabase(application)
     private val dao = db.telemetryDao()
     private val recorder = AudioTelemetryManager()
+
     private val whisperEngine by lazy {
         OnDeviceWhisperEngine(application.applicationContext)
     }
 
-    // Live observable state for UI
+    // --- Observable UI States ---
     var latestEngagementMetrics by mutableStateOf(com.example.aim_android.model.EngagementMetrics())
         private set
-
-    // Math smoothing variables
-    private var smoothedVerbalScore = 0.0f
-    private val decayLambda = 0.15f // Determines how quickly verbal score drops when silent
-    private var totalWordsInSession = 0
-    private val recordedScores = mutableListOf<Float>()
-
-    private var currentSessionId: Long? = null
-    private var currentVisionScore: Float = 0f
-    private var currentEyeMetrics: EyeMetrics? = null
-    private var currentHeadPose: HeadPose? = null
-    private var isFaceDetected: Boolean = false
 
     var isRecording by mutableStateOf(false)
         private set
@@ -60,19 +50,131 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
     var errorMessage by mutableStateOf<String?>(null)
         private set
 
-    // Buffer to accumulate active speech samples for Whisper decoding
+    // --- Offline Llama GGUF Mentor State ---
+    var currentQuestion by mutableStateOf("What is a deadlock in OS?")
+        private set
+
+    var mentorFeedback by mutableStateOf<String?>(null)
+        private set
+
+    var isEvaluating by mutableStateOf(false)
+        private set
+
+    var isModelReady by mutableStateOf(false)
+        private set
+
+    // Math smoothing variables
+    private var smoothedVerbalScore = 0.0f
+    private val decayLambda = 0.15f
+    private var totalWordsInSession = 0
+    private val recordedScores = mutableListOf<Float>()
+
+    private var currentSessionId: Long? = null
+    private var currentVisionScore: Float = 0f
+    private var currentEyeMetrics: EyeMetrics? = null
+    private var currentHeadPose: HeadPose? = null
+    private var isFaceDetected: Boolean = false
+
+    // Audio Accumulation & VAD Buffer (16 kHz, 1.0s window = 16,000 samples)
     private val speechAccumulator = ArrayList<Float>()
+    private val bufferLock = Any()
+    private val targetChunkSamples = 16000
+    private var silenceFrames = 0
+    private var lastSavedText = ""
+
+    // LLaMA native wrapper instance
+    private var llamaInstance: LlamaInstance? = null
 
     init {
+        // Initialize Room DB schema
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Force Room database file creation on disk immediately for Database Inspector
                 db.openHelper.writableDatabase
                 Log.d("AIM_DB", "Database initialized on disk successfully.")
             } catch (e: Exception) {
                 Log.e("AIM_DB", "Database initialization error: ${e.localizedMessage}", e)
             }
         }
+
+        // Verify model and preload weights once into RAM
+        checkAndPreloadModel()
+    }
+
+    private fun checkAndPreloadModel() {
+        val modelFile = File(getApplication<Application>().getExternalFilesDir(null), "aim_mentor_q4.gguf")
+        isModelReady = modelFile.exists() && modelFile.canRead()
+        Log.d("AIM_MENTOR", "Llama GGUF Model Available: $isModelReady at ${modelFile.absolutePath}")
+
+        if (isModelReady) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    if (llamaInstance == null) {
+                        Log.d("AIM_MENTOR", "Pre-warming LlamaInstance into memory...")
+                        llamaInstance = LlamaInstance(modelFile.absolutePath)
+                        Log.d("AIM_MENTOR", "LlamaInstance preloaded successfully.")
+                    }
+                } catch (e: Throwable) {
+                    Log.e("AIM_MENTOR", "Failed to preload model: ${e.localizedMessage}", e)
+                }
+            }
+        }
+    }
+
+    private suspend fun runInferenceBridge(
+        modelPath: String,
+        question: String,
+        candidateAnswer: String
+    ): String = withContext(Dispatchers.IO) {
+        try {
+            if (llamaInstance == null) {
+                Log.d("AIM_MENTOR", "Initializing LlamaInstance at: $modelPath")
+                llamaInstance = LlamaInstance(modelPath)
+            }
+
+            val llama = llamaInstance ?: throw IllegalStateException("LlamaInstance failed to load")
+
+            val systemPrompt = """
+                You are a strict, objective technical interviewer. 
+                Grade the candidate's answer to the given question on a scale of 0 to 100.
+                
+                Grading Rubric:
+                - 0-20: Admitting lack of knowledge (e.g., "I don't know"), irrelevant, or blank answers.
+                - 21-50: Partially correct or missing crucial core concepts.
+                - 51-80: Conceptually correct but missing technical depth or edge cases.
+                - 81-100: Thorough, technically precise, and complete.
+
+                Output strictly in this format:
+                Score: <number>/100
+                Feedback: <1-2 sentences explaining why the score was given>
+            """.trimIndent()
+
+            val userPrompt = """
+                Question: $question
+                Candidate Answer: "$candidateAnswer"
+            """.trimIndent()
+
+            val formattedPrompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n$systemPrompt<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n$userPrompt<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            Log.d("AIM_MENTOR", "Dispatching formatted prompt to native inference...")
+
+            val rawOutput = llama.generateEvaluation(formattedPrompt, maxTokens = 40)
+            Log.d("AIM_MENTOR", "Native generateEvaluation returned output length: ${rawOutput.length}")
+
+            rawOutput
+                .replace("<|eot_id|>", "")
+                .replace("<|start_header_id|>assistant<|end_header_id|>", "")
+                .replace("<|end_of_text|>", "")
+                .trim()
+                .ifBlank { "Score: 0/100\nFeedback: No evaluation returned from model." }
+        } catch (e: Throwable) {
+            Log.e("AIM_MENTOR", "Llama inference error", e)
+            "Score: 0/100\nFeedback: Model execution error: ${e.localizedMessage}"
+        }
+    }
+
+    @Suppress("unused")
+    fun setInterviewQuestion(question: String) {
+        currentQuestion = question
+        mentorFeedback = null
     }
 
     fun updateVisionMetrics(
@@ -88,11 +190,13 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     fun startStreaming() {
+        if (isRecording) return
+
         smoothedVerbalScore = 0f
         totalWordsInSession = 0
         recordedScores.clear()
-
-        if (isRecording) return
+        lastSavedText = ""
+        latestTranscript = ""
         errorMessage = null
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -115,29 +219,35 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
             Log.e("AIM_AUDIO", "SecurityException starting AudioRecord", e)
             isRecording = false
             errorMessage = "Microphone permission required: ${e.localizedMessage}"
-        } catch (e: IllegalStateException) {
-            Log.e("AIM_AUDIO", "IllegalStateException starting AudioRecord", e)
-            isRecording = false
-            errorMessage = "Audio hardware error: ${e.localizedMessage}"
         } catch (e: Exception) {
             Log.e("AIM_AUDIO", "Exception starting audio recording", e)
             isRecording = false
             errorMessage = "Audio error: ${e.localizedMessage}"
         }
     }
-    private var lastSavedText = ""
-    fun stopStreaming() {
 
+    fun stopStreaming() {
+        isRecording = false
+
+        // Flush any pending audio before stopping
         synchronized(bufferLock) {
-            speechAccumulator.clear()
+            if (speechAccumulator.isNotEmpty()) {
+                val remainingAudio = speechAccumulator.toFloatArray()
+                speechAccumulator.clear()
+                silenceFrames = 0
+                if (remainingAudio.size >= 8000) {
+                    dispatchTranscription(remainingAudio)
+                }
+            }
         }
         lastSavedText = ""
-        isRecording = false
+
         try {
             recorder.stopRecording()
         } catch (e: Exception) {
             Log.e("AIM_AUDIO", "Error stopping audio recorder", e)
         }
+
         val sessionId = currentSessionId
         if (sessionId != null) {
             val avgScore = if (recordedScores.isNotEmpty()) recordedScores.average().toFloat() else 0f
@@ -162,104 +272,19 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
         currentSessionId = null
     }
 
-    // In TelemetryViewModel.kt
-
-    // Buffer to hold raw PCM samples (16kHz)
-    private val MIN_CHUNK_SAMPLES = (16000 * 2.5).toInt() // 2.5s window
-    private val bufferLock = Any()
-    private var isSessionActive = false // Guard against late background inserts
-
-    fun onAudioBufferReceived(floatSamples: FloatArray, rms: Float) {
-        if (!isSessionActive) return
-
-        synchronized(bufferLock) {
-            // Collect voice audio
-            if (rms > 0.018f) {
-                for (sample in floatSamples) {
-                    speechAccumulator.add(sample)
-                }
-            }
-
-            // Only dispatch when we have accumulated a full 2.5 seconds of voice
-            if (speechAccumulator.size >= MIN_CHUNK_SAMPLES) {
-                val chunkToProcess = speechAccumulator.toFloatArray()
-                speechAccumulator.clear()
-                processAudioChunk(chunkToProcess)
-            }
-        }
-    }
-
-    private fun processAudioChunk(audioSamples: FloatArray) {
-        viewModelScope.launch(Dispatchers.Default) {
-            val rawText = whisperEngine.transcribe(audioSamples)
-            val cleanedText = rawText
-                .replace(Regex("\\[.*?\\]"), "")
-                .replace(Regex("\\(.*?\\)"), "")
-                .trim()
-
-            if (cleanedText.isBlank()) return@launch
-
-            // Deduplicate overlap with previous phrase
-            val previousWords = lastSavedText.lowercase().split("\\s+".toRegex()).filter { it.isNotBlank() }
-            val currentWords = cleanedText.lowercase().split("\\s+".toRegex()).filter { it.isNotBlank() }
-
-            var overlapCount = 0
-            val maxCheck = minOf(previousWords.size, currentWords.size)
-            for (i in maxCheck downTo 1) {
-                if (previousWords.takeLast(i) == currentWords.take(i)) {
-                    overlapCount = i
-                    break
-                }
-            }
-
-            val newWordsList = currentWords.drop(overlapCount)
-            if (newWordsList.isEmpty()) return@launch
-
-            val textToSave = newWordsList.joinToString(" ")
-            lastSavedText = cleanedText
-            val wordCount = newWordsList.size
-
-            totalWordsInSession += wordCount
-
-            withContext(Dispatchers.Main) {
-                latestTranscript = textToSave
-            }
-
-            currentSessionId?.let { id ->
-                viewModelScope.launch(Dispatchers.IO) {
-                    try {
-                        dao.insertTranscript(
-                            TranscriptEntity(
-                                sessionId = id,
-                                timestamp = System.currentTimeMillis(),
-                                text = textToSave,
-                                wordCount = wordCount
-                            )
-                        )
-                        Log.d("AIM_DB", "SAVED TRANSCRIPT to Session $id: $textToSave")
-                    } catch (e: Exception) {
-                        Log.e("AIM_DB", "Failed to insert transcript", e)
-                    }
-                }
-            }
-        }
-    }
-
     private fun processAudioChunkLocally(bytes: ByteArray) {
         viewModelScope.launch(Dispatchers.Default) {
             try {
-                // 1. Convert 16-bit PCM ByteArray into FloatArray [-1.0f, 1.0f]
                 val floatSamples = pcmBytesToFloats(bytes)
                 if (floatSamples.isEmpty()) return@launch
 
-                // 2. Compute On-Device Audio Features
                 val rms = calculateRms(floatSamples)
                 val zcr = calculateZcr(floatSamples)
                 val centroid = calculateSpectralCentroid(floatSamples)
 
                 val instantVerbal = if (rms > 0.005f) 100f else 0f
-                smoothedVerbalScore = (smoothedVerbalScore * kotlin.math.exp(-decayLambda)) +
-                        (instantVerbal * (1f - kotlin.math.exp(-decayLambda)))
+                val decay = exp(-decayLambda)
+                smoothedVerbalScore = (smoothedVerbalScore * decay) + (instantVerbal * (1f - decay))
 
                 val cei = ((currentVisionScore * 0.6f) + (smoothedVerbalScore * 0.4f)).coerceIn(0f, 100f)
                 recordedScores.add(currentVisionScore)
@@ -289,7 +314,6 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
                     )
                 }
 
-                // Insert 1 Hz Telemetry Sample into Room database if recording session active
                 val sessionId = currentSessionId
                 if (sessionId != null) {
                     viewModelScope.launch(Dispatchers.IO) {
@@ -305,60 +329,143 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
                                 spectralCentroidHz = centroid
                             )
                             dao.insertTelemetrySample(sampleEntity)
-                            Log.d("AIM_DB", "SAVED TELEMETRY SAMPLE -> Session $sessionId")
                         } catch (e: Exception) {
                             Log.e("AIM_DB", "Failed to insert telemetry sample", e)
                         }
                     }
                 }
 
-                // 3. On-Device Voice Activity Detection & Fixed Window Whisper Transcription
-                if (rms > 0.005f) { // Active speech threshold
-                    for (sample in floatSamples) {
-                        speechAccumulator.add(sample)
+                // Voice Activity Accumulation for Whisper
+                synchronized(bufferLock) {
+                    if (rms > 0.004f) {
+                        for (sample in floatSamples) {
+                            speechAccumulator.add(sample)
+                        }
+                        silenceFrames = 0
+                    } else if (speechAccumulator.isNotEmpty()) {
+                        silenceFrames++
                     }
-                }
 
-                if (speechAccumulator.size >= 16000) { // Transcribe every 1 second (16k samples)
-                    val audioToTranscribe = speechAccumulator.toFloatArray()
-                    speechAccumulator.clear()
+                    val shouldFlush = speechAccumulator.size >= targetChunkSamples ||
+                            (speechAccumulator.size >= 8000 && silenceFrames >= 2)
 
-                    val text = whisperEngine.transcribe(audioToTranscribe)
-                    Log.d("AIM_AUDIO", "Transcribed: $text")
-                    if (text.isNotBlank()) {
-                        val words = text.trim().split("\\s+".toRegex()).size
-                        totalWordsInSession += words
-                        withContext(Dispatchers.Main) {
-                            latestTranscript = text
-                        }
-
-                        if (sessionId != null) {
-                            viewModelScope.launch(Dispatchers.IO) {
-                                try {
-                                    val transcriptEntity = TranscriptEntity(
-                                        sessionId = sessionId,
-                                        timestamp = System.currentTimeMillis(),
-                                        text = text,
-                                        wordCount = text.trim().split("\\s+".toRegex()).size
-                                    )
-                                    dao.insertTranscript(transcriptEntity)
-                                    Log.d("AIM_DB", "SAVED TRANSCRIPT to Session $sessionId: $text")
-                                } catch (e: Exception) {
-                                    Log.e("AIM_DB", "Failed to insert transcript", e)
-                                }
-                            }
-                        }
+                    if (shouldFlush) {
+                        val audioToTranscribe = speechAccumulator.toFloatArray()
+                        speechAccumulator.clear()
+                        silenceFrames = 0
+                        dispatchTranscription(audioToTranscribe)
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    errorMessage = "On-Device Audio Error: ${e.localizedMessage}"
+                    errorMessage = "Audio Error: ${e.localizedMessage}"
                 }
             }
         }
     }
 
-    // Converts 16-bit Little-Endian PCM byte array to normalized float array
+    private fun dispatchTranscription(audioSamples: FloatArray) {
+        Log.d("AIM_WHISPER", "dispatchTranscription called with ${audioSamples.size} samples")
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                val rawText = whisperEngine.transcribe(audioSamples).trim()
+                Log.d("AIM_WHISPER", "Whisper raw output: '$rawText'")
+                if (rawText.isBlank()) return@launch
+
+                val cleaned = rawText
+                    .replace(Regex("\\[.*?\\]"), "")
+                    .replace(Regex("\\(.*?\\)"), "")
+                    .replace(Regex("\\.{2,}"), ".")
+                    .trim()
+
+                val words = cleaned.split("\\s+".toRegex()).filter { it.isNotBlank() }
+                if (words.size > 4) {
+                    val half = words.size / 2
+                    val firstHalf = words.subList(0, half).joinToString(" ")
+                    val secondHalf = words.subList(half, words.size).joinToString(" ")
+                    if (firstHalf.equals(secondHalf, ignoreCase = true)) {
+                        return@launch
+                    }
+                }
+
+                if (lastSavedText.contains(cleaned, ignoreCase = true) || cleaned.contains(lastSavedText, ignoreCase = true)) {
+                    if (cleaned.length <= lastSavedText.length) return@launch
+                }
+
+                lastSavedText = cleaned
+                val wordCount = words.size
+                totalWordsInSession += wordCount
+
+                withContext(Dispatchers.Main) {
+                    if (latestTranscript.isBlank()) {
+                        latestTranscript = cleaned
+                    } else if (!latestTranscript.endsWith(cleaned, ignoreCase = true)) {
+                        latestTranscript = "$latestTranscript $cleaned"
+                    }
+                }
+
+                currentSessionId?.let { sId ->
+                    viewModelScope.launch(Dispatchers.IO) {
+                        try {
+                            dao.insertTranscript(
+                                TranscriptEntity(
+                                    sessionId = sId,
+                                    timestamp = System.currentTimeMillis(),
+                                    text = cleaned,
+                                    wordCount = wordCount
+                                )
+                            )
+                        } catch (e: Exception) {
+                            Log.e("AIM_DB", "Failed to insert transcript", e)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("AIM_WHISPER", "Transcription failure", e)
+            }
+        }
+    }
+
+    // --- On-Device Llama GGUF Evaluation Trigger ---
+    fun evaluateCandidateAnswer(customAnswer: String? = null) {
+        val answerToEvaluate = (customAnswer ?: latestTranscript).trim()
+        if (answerToEvaluate.isBlank()) {
+            errorMessage = "No answer transcribed to evaluate yet. Speak your response first."
+            return
+        }
+
+        val modelFile = File(getApplication<Application>().getExternalFilesDir(null), "aim_mentor_q4.gguf")
+        if (!modelFile.exists() || !modelFile.canRead()) {
+            errorMessage = "aim_mentor_q4.gguf not found at ${modelFile.absolutePath}"
+            return
+        }
+
+        isEvaluating = true
+        errorMessage = null
+
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                Log.d("AIM_MENTOR", "Evaluating answer: \"$answerToEvaluate\" for question: \"$currentQuestion\"")
+                val result = runInferenceBridge(modelFile.absolutePath, currentQuestion, answerToEvaluate)
+                Log.d("AIM_MENTOR", "Inference bridge returned result: $result")
+
+                withContext(Dispatchers.Main) {
+                    mentorFeedback = result
+                }
+            } catch (e: Throwable) {
+                Log.e("AIM_MENTOR", "Evaluation coroutine error", e)
+                withContext(Dispatchers.Main) {
+                    errorMessage = "Evaluation failed: ${e.localizedMessage}"
+                }
+            } finally {
+                withContext(Dispatchers.Main) {
+                    isEvaluating = false
+                }
+            }
+        }
+    }
+
+    // --- Feature Extraction Math ---
     private fun pcmBytesToFloats(bytes: ByteArray): FloatArray {
         val shortBuffer = ByteBuffer.wrap(bytes)
             .order(ByteOrder.LITTLE_ENDIAN)
@@ -391,7 +498,6 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
     }
 
     private fun calculateSpectralCentroid(samples: FloatArray): Float {
-        // Approximate high-frequency density via sample gradient
         var num = 0.0f
         var den = 0.0001f
         for (i in 1 until samples.size) {
@@ -407,5 +513,7 @@ class TelemetryViewModel(application: Application) : AndroidViewModel(applicatio
         super.onCleared()
         recorder.stopRecording()
         whisperEngine.release()
+        llamaInstance?.release()
+        llamaInstance = null
     }
 }

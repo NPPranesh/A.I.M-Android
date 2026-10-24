@@ -16,7 +16,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,14 +32,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import com.example.aim_android.models.EyeMetrics
-import com.example.aim_android.models.HeadPose
 
 class MainActivity : ComponentActivity() {
 
     private val viewModel: TelemetryViewModel by viewModels()
 
-    // Multiple permissions launcher: Camera + Audio
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -45,7 +44,7 @@ class MainActivity : ComponentActivity() {
         if (audioGranted) {
             viewModel.startStreaming()
         } else {
-            Toast.makeText(this, "Microphone permission is required to run offline Whisper.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Microphone permission is required for offline Whisper.", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -67,6 +66,10 @@ class MainActivity : ComponentActivity() {
                             } else {
                                 checkAndStartAudio()
                             }
+                        },
+                        onEvaluateAnswer = { transcript ->
+                            Log.d("AIM_MENTOR", "MainActivity: onEvaluateAnswer triggered with: '$transcript'")
+                            viewModel.evaluateCandidateAnswer(transcript)
                         }
                     )
                 }
@@ -101,15 +104,11 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun MultimodalTelemetryDashboard(
     viewModel: TelemetryViewModel,
-    onToggleRecording: () -> Unit
+    onToggleRecording: () -> Unit,
+    onEvaluateAnswer: (String) -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-
-    // Vision Telemetry State
-    var attentionScore by remember { mutableFloatStateOf(0.0f) }
-    var eyeMetrics by remember { mutableStateOf<EyeMetrics?>(null) }
-    var headPose by remember { mutableStateOf<HeadPose?>(null) }
 
     val hasCameraPermission = ContextCompat.checkSelfPermission(
         context,
@@ -134,9 +133,7 @@ fun MultimodalTelemetryDashboard(
                         val analyzer = AimVisionAnalyzer(
                             context = ctx,
                             onMetricsCalculated = { eye, head, score ->
-                                attentionScore = score
-                                eyeMetrics = eye
-                                headPose = head
+                                // Delegate exclusively to the ViewModel to prevent 30fps recomposition jitter
                                 viewModel.updateVisionMetrics(
                                     visionScore = score,
                                     eyeMetrics = eye,
@@ -187,11 +184,15 @@ fun MultimodalTelemetryDashboard(
         }
 
         // --- 2. Live Multimodal HUD Overlay ---
+        val engagement = viewModel.latestEngagementMetrics
+        val attentionScore = engagement.visualAttentionScore
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.SpaceBetween
+                .padding(16.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             // Top Card: Vision Telemetry
             Card(
@@ -238,9 +239,94 @@ fun MultimodalTelemetryDashboard(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        MetricBadge("Gaze", eyeMetrics?.isGazeFocused == true, "Focused", "Averted")
-                        MetricBadge("Blink", eyeMetrics?.isBlinking == true, "Blinking", "Open")
-                        MetricBadge("Head", headPose?.isFacingScreen == true, "Centered", "Turned")
+                        MetricBadge("Level", true, engagement.engagementLevel.name, "LOW")
+                        MetricBadge("Verbal", engagement.verbalEngagementScore > 30f, "Active", "Quiet")
+                        MetricBadge("CEI", engagement.combinedEngagementIndex > 50f, "${engagement.combinedEngagementIndex.toInt()}%", "Low")
+                    }
+                }
+            }
+
+            // Middle Card: AI Interview Mentor Evaluation (Llama-3.2 GGUF)
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xDD1A1A2E))
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "AI Mentor Evaluation",
+                            color = Color(0xFF90CAF9),
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            if (viewModel.isModelReady) "Q4 Model Ready" else "Model Missing",
+                            color = if (viewModel.isModelReady) Color(0xFF81C784) else Color(0xFFFF8A80),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Text(
+                        text = "Q: ${viewModel.currentQuestion}",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+
+                    if (viewModel.isEvaluating) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                color = Color(0xFF90CAF9),
+                                strokeWidth = 2.dp
+                            )
+                            Text(
+                                "Evaluating response on-device...",
+                                color = Color.LightGray,
+                                fontSize = 12.sp
+                            )
+                        }
+                    } else if (viewModel.mentorFeedback != null) {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = Color(0x55000000),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = viewModel.mentorFeedback ?: "",
+                                color = Color(0xFFE0E0E0),
+                                fontSize = 13.sp,
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            Log.d("AIM_MENTOR", "Button tapped directly! latestTranscript='${viewModel.latestTranscript}'")
+                            onEvaluateAnswer(viewModel.latestTranscript)
+                        },
+                        enabled = !viewModel.isEvaluating && viewModel.isModelReady,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(38.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF3F51B5)
+                        )
+                    ) {
+                        Text("Evaluate Spoken Answer", fontSize = 13.sp)
                     }
                 }
             }
@@ -297,7 +383,6 @@ fun MultimodalTelemetryDashboard(
                         }
                     }
 
-                    // Live Whisper Transcript Display
                     Text(
                         text = "Transcript: ${viewModel.latestTranscript.ifEmpty { "Listening..." }}",
                         color = Color.Green,
@@ -308,7 +393,7 @@ fun MultimodalTelemetryDashboard(
                         Text(text = err, color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                     }
 
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
 
                     Button(
                         onClick = onToggleRecording,
